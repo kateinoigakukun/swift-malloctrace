@@ -1,0 +1,385 @@
+<!-- Original viewer by vshymanskyy https://gist.github.com/vshymanskyy/f041cc1a621af3d291d4d1e1760dd7bb -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type">
+    <meta content="utf-8" http-equiv="encoding">
+
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+
+<style>
+    html,
+    body {
+        height: 100%;
+        width: 100%;
+        margin: 0em;
+    }
+
+    code {
+        font-family: monospace;
+        font-size: 1.2em;
+    }
+
+    .controls {
+        overflow: hidden;
+        background-color: white;
+        position: fixed;
+        top: 0;
+        width: 100%;
+        height: 60px;
+        padding: 10px;
+    }
+
+    .main {
+        margin-top: 120px;
+    }
+
+</style>
+
+<body>
+
+    <div class="controls">
+        <input type="button" id="save" value="💾">
+        <label for="time"><span id="time-value" style="display: inline-block; text-align: right; width: 60px;">…</span>
+            ms</label>
+        <input type="range" id="time" value="0" style="width: 1000px;">
+        <input type="button" id="play" value="⏩" title="Play (monotonic) | keyboard: Space">
+        <div style="margin: 8px;">
+            <input type="file" id="profile" accept=".csv" title="Load profile">
+        </div>
+    </div>
+    <div class="main">
+    </div>
+
+    <script>
+        function mapaddr(a) {
+            return a;
+        }
+        function load() {
+            const file = document.getElementById('profile').files[0];
+            const url = URL.createObjectURL(file);
+            return d3.dsv(',', url, (d) => {
+                if (d.Operation === "free" && +d.Addr === 0) {
+                    return null;
+                }
+                return {
+                    ts: d.Timestamp,
+                    op: d.Operation,
+
+                    name: d.Name,
+                    size: +d.Size > 0 ? +d.Size : 1,
+
+                    count: +d.Count > 0 ? +d.Count : 1,
+                    addr: mapaddr(+d.Addr),
+                    caller: d.Caller,
+                    old: {
+                        count: +d.OldCount,
+                        addr: mapaddr(+d.OldAddr),
+                    }
+                }
+            });
+        }
+
+        class ColorPicker {
+            constructor() {
+                this.cacheByName = {};
+                this.cursor = 0;
+                this.palette = ["#FC3691", "#1EE3E1", "#FAA90D",
+                    "#34B971", "#BB3150", "#69EB17",
+                    "#0755de", "#345E21", "#945416",
+                    "#5E48D8", "#A88DEE", "#D4F631",
+                    "#5681DA", "#B962B9", "#288699",
+                    "#A05B43", "#A1CD6F", "#6F1E40",
+                    "#AD9C4D", "#71A3B7", "#3B6676"];
+            }
+
+            pickByName(name) {
+                let cache = this.cacheByName[name];
+                if (cache) return cache;
+
+                const color = this.palette[this.cursor];
+                this.cacheByName[name] = color;
+                this.cursor = (this.cursor + 1) % this.palette.length;
+                return color;
+            }
+        }
+
+
+        class Timeline {
+            constructor(tspace) {
+                this.currentChunkMap = {}
+                this.chunks = [];
+                this.tspace = tspace;
+                this.colorPicker = new ColorPicker();
+            }
+
+            addEvent(event) {
+                const color = this.colorPicker.pickByName(event.name);
+
+                switch (event.op) {
+                    case "malloc":
+                    case "calloc":
+                        let chunk = { id: event.ts, ts_max: this.tspace.max, color, ...event };
+                        this.currentChunkMap[event.addr] = chunk;
+                        this.chunks.push(chunk);
+                        break;
+                    case "free":
+                        if (this.currentChunkMap[event.addr]) {
+                            this.currentChunkMap[event.addr].ts_max = event.ts;
+                            delete this.currentChunkMap[event.addr];
+                        }
+                        break;
+                    case "realloc": {
+                        let oldChunk = this.currentChunkMap[event.old.addr];
+                        let chunk;
+                        if (oldChunk) {
+                            delete this.currentChunkMap[event.old.addr];
+                            oldChunk.ts_max = event.ts;
+                            chunk = { id: oldChunk.id, color, ...event }
+                        } else {
+                            chunk = { id: event.ts, color, ...event };
+                        }
+                        this.currentChunkMap[event.addr] = chunk;
+                        this.chunks.push(chunk);
+                        break
+                    }
+                    default:
+                        throw (`Unknown operation ${event.op}`);
+                }
+            }
+        }
+
+        class TimelineView {
+            constructor(timeline, aspace, tspace, line) {
+                function computeChunkViews(chunk) {
+                    let length = chunk.size * chunk.count;
+                    let offset = chunk.addr - aspace.min;
+
+                    let views = [];
+                    while (length > 0) {
+                        let len = Math.min(length, line.bytes - offset % line.bytes);
+                        views.push({ id: `${chunk.id}_${views.length}`, offset, len, chunk });
+                        offset += len;
+                        length -= len;
+                    }
+                    return views;
+                }
+                this.line = line;
+                this.aspace = aspace;
+                this.tspace = tspace;
+                this.allChunkViews = timeline.chunks.flatMap((d) => computeChunkViews(d))
+                this.mount()
+            }
+
+            mount() {
+                const line = this.line;
+                const aspace = this.aspace;
+                const tspace = this.tspace;
+                const svg = d3.select("body").append('svg')
+                    .attr('id', 'd3-canvas')
+                    .attr('width', line.width + 100)
+                    .attr('height', (line.count + 3) * line.height);
+
+                this.tooltip = d3.select("body")
+                    .append("div")
+                    .style("position", "absolute")
+                    .style("background-color", "rgba(240, 240, 240, 0.8)")
+                    .style("border-radius", "5px")
+                    .style("padding", "7px")
+                    .style("z-index", "10")
+                    .style("opacity", 1);
+
+                // Addresses
+                svg.append("g")
+                    .selectAll("text")
+                    .data(d3.range(line.count + 1))
+                    .enter()
+                    .append("text").text((d) => "0x" + (aspace.min + d * line.bytes).toString(16))
+                    .attr("x", 90)
+                    .attr("y", (d) => (d + 1) * line.height - 4)
+                    .attr("font-family", "monospace")
+                    .attr("text-anchor", "end");
+
+                d3.select("#time")
+                    .attr("min", tspace.min)
+                    .attr("max", tspace.max)
+                    .on("input", (e) => this.update(+e.srcElement.value));
+
+                let playing = false;
+                d3.select("#play").on("click", async (e) => {
+                    const btn = e.srcElement;
+                    if (playing) { btn.value = "⏩"; playing = false; return; }
+                    else { btn.value = "🚫"; playing = true; }
+                    let current = +d3.select("#time").property("value");
+                    for (let i = current; i < tspace.max + 5 && playing; i += 5) {
+                        this.update(i);
+                        await sleep(20);
+                    }
+
+                    btn.value = "⏩";
+                    playing = false;
+                });
+
+                d3.select("#save").on("click", () => {
+                    saveSvg(document.getElementById("d3-canvas"), "heap_view.svg");
+                });
+
+                this.g_blocks = svg.append("g")
+                    .attr("transform", `translate(100, 0)`);
+            }
+
+            formatStacktrace(trace) {
+                return "<ul>" + trace.replace(/^Error/, "").replace(/\s+at (.+) \(.*\)/g, "<li>$1</li>") + "</ul>";
+            }
+
+            update(time) {
+                const line = this.line;
+                const g_blocks = this.g_blocks;
+                const tooltip = this.tooltip;
+                d3.select("#time-value").text(time);
+                d3.select("#time").property("value", time);
+
+                let chunks = this.allChunkViews.filter((el) => (el.chunk.ts <= time && el.chunk.ts_max >= time));
+
+                let sel = g_blocks.selectAll("rect")
+                    .data(chunks, (d) => d.id);
+
+
+                const animationDuration = 50;
+                const animationEasing = d3.easeCubic;
+
+                // Blocks
+                sel.exit()
+                    .transition().ease(animationEasing).duration(animationDuration)
+                    .attr("opacity", 0)
+                    .remove();
+
+                let rect = sel.enter()
+                    .append("rect")
+                    .attr("stroke", "rgba(0,0,0,0.2)")
+                    .attr("fill", (ch) => ch.chunk.color)
+                    .attr("x", (ch) => (ch.offset % line.bytes) * line.scale)
+                    .attr("y", (ch) => Math.floor(ch.offset / line.bytes) * line.height)
+                    .attr("height", line.height)
+                    //.attr("width", (ch) => ch.len * line.scale) // << Animate
+                    .attr("opacity", 0);
+
+                rect.merge(sel)
+                    .transition().ease(animationEasing).duration(animationDuration)
+                    .attr("opacity", 1)
+                    .attr("x", (ch) => (ch.offset % line.bytes) * line.scale)
+                    .attr("y", (ch) => Math.floor(ch.offset / line.bytes) * line.height)
+                    .attr("height", line.height)
+                    .attr("width", (ch) => ch.len * line.scale);
+
+                // Tooltip
+                rect.on("dblclick", (e, d) => {
+                    // Navigate to the last time the block was updated
+                    this.update(d.chunk.ts);
+                }).on("mouseover", (e, d) => {
+                    tooltip.style("opacity", 1).html(
+                        `<b>${d.chunk.name}</b><br/>` +
+                        `<code>0x${d.chunk.addr.toString(16)}</code><br/>` +
+                        `<code>${d.chunk.size * d.chunk.count}</code> bytes<br/>` +
+                        `<code>${d.chunk.count}</code> items<br/>` +
+                        `<code>${this.formatStacktrace(d.chunk.caller)}</code>`
+                    ); //.text(JSON.stringify(d,null,2));
+                }).on('mouseout', (e, d) => {
+                    tooltip.style("opacity", 0);
+                }).on('mousemove', (e, d) => {
+                    tooltip
+                        .style('left', e.pageX + 10 + 'px')
+                        .style('top', e.pageY + 10 + 'px')
+                });
+
+
+                // Labels
+                let labels = chunks.filter((ch) => (ch.id.endsWith("_0") && ch.len * line.scale > 100));
+                let sel_text = g_blocks.selectAll("text")
+                    .data(labels, (d) => d.id);
+
+                sel_text
+                    .enter()
+                    .append("text")
+                    .attr("x", (ch) => (ch.offset % line.bytes) * line.scale)
+                    .attr("y", (ch) => Math.floor(ch.offset / line.bytes) * line.height + 14)
+                    .attr("pointer-events", "none")
+                    .attr("opacity", 0)
+                    .merge(sel_text)
+                    .transition().ease(animationEasing).duration(animationDuration)
+                    .attr("opacity", 1)
+                    .text((ch) => ch.chunk.name)
+                    .attr("x", (ch) => (ch.offset % line.bytes) * line.scale)
+                    .attr("y", (ch) => Math.floor(ch.offset / line.bytes) * line.height + 14);
+
+                sel_text
+                    .exit()
+                    .transition().ease(animationEasing).duration(animationDuration)
+                    .attr("opacity", 0)
+                    .remove();
+
+            }
+        }
+
+        function makeTimeline(data, tspace) {
+            const timeline = new Timeline(tspace);
+            for (const event of data) {
+                timeline.addEvent(event);
+            }
+            return timeline;
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        function saveSvg(svgEl, name) {
+            svgEl.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+            var svgData = svgEl.outerHTML;
+            var preface = '<?xml version="1.0" standalone="no"?>\r\n';
+            var svgBlob = new Blob([preface, svgData], { type: "image/svg+xml;charset=utf-8" });
+            var svgUrl = URL.createObjectURL(svgBlob);
+            var downloadLink = document.createElement("a");
+            downloadLink.href = svgUrl;
+            downloadLink.download = name;
+            document.body.appendChild(downloadLink);
+            downloadLink.click();
+            document.body.removeChild(downloadLink);
+        }
+
+        function makeChunkViewConfig(aspace) {
+            const config = { bytes: 4 * 1024, width: 1 * 1024, height: 16 };
+            config.count = Math.floor((aspace.max - aspace.min) / config.bytes);
+            config.scale = config.width / config.bytes;
+            return config
+        }
+
+        async function main() {
+            let data = await load();
+
+            const tstamps = data.map((el) => el.ts);
+            const addrs = data.map((el) => el.addr);
+            const endings = data.map((el) => el.addr + el.count * el.size);
+
+            const tspace = { min: Math.min.apply(null, tstamps), max: Math.max.apply(null, tstamps) }
+            const aspace = { min: Math.min.apply(null, addrs), max: Math.max.apply(null, endings) }
+            console.log(`Min addr: 0x${aspace.min.toString(16)}, Max addr: 0x${aspace.max.toString(16)}`);
+
+            const timeline = makeTimeline(data, tspace);
+            const line = makeChunkViewConfig(aspace);
+            const timelineView = new TimelineView(timeline, aspace, tspace, line);
+
+            timelineView.update(tspace.min);
+        }
+
+        d3.select("#profile").on("change", (e) => {
+            const profile = e.target.value;
+            console.log(`Loading profile ${profile}`);
+            main();
+        });
+    </script>
+</body>
+
+</html>
