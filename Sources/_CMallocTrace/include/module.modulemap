@@ -1,0 +1,4 @@
+module _CMallocTrace {
+    header "_CMallocTrace.h"
+    export *
+}
