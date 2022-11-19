@@ -230,8 +230,14 @@
                     .attr("transform", `translate(100, 0)`);
             }
 
+            formatName(name) {
+                return name.replace(/(?:<\?>\.wasm-function)?(.+)@.+/g, "$1");
+            }
+
             formatStacktrace(trace) {
-                return "<ul>" + trace.replace(/^Error/, "").replace(/\s+at (.+) \(.*\)/g, "<li>$1</li>") + "</ul>";
+                return "<ul>" + trace
+                    .replace(/^Error/, "").replace(/\s+at (.+) \(.*\)/g, "<li>$1</li>")
+                    .replace(/(?:<\?>\.wasm-function)?(.+)@.+\n/g, "<li>$1</li>\n") + "</ul>";
             }
 
             update(time) {
@@ -280,7 +286,7 @@
                     this.update(d.chunk.ts);
                 }).on("mouseover", (e, d) => {
                     tooltip.style("opacity", 1).html(
-                        `<b>${d.chunk.name}</b><br/>` +
+                        `<b>${this.formatName(d.chunk.name)}</b><br/>` +
                         `<code>0x${d.chunk.addr.toString(16)}</code><br/>` +
                         `<code>${d.chunk.size * d.chunk.count}</code> bytes<br/>` +
                         `<code>${d.chunk.count}</code> items<br/>` +
@@ -310,7 +316,7 @@
                     .merge(sel_text)
                     .transition().ease(animationEasing).duration(animationDuration)
                     .attr("opacity", 1)
-                    .text((ch) => ch.chunk.name)
+                    .text((ch) => this.formatName(ch.chunk.name))
                     .attr("x", (ch) => (ch.offset % line.bytes) * line.scale)
                     .attr("y", (ch) => Math.floor(ch.offset / line.bytes) * line.height + 14);
 
